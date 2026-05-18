@@ -1,0 +1,808 @@
+"""
+=============================================================
+  TIME SERIES ANALYSIS — ANOMALY DETECTION & PREDICTION
+  Full Pipeline: Load → Clean → Detect → Predict → Plot
+=============================================================
+Improvements over v1:
+  - YAML/argparse config (no hardcoded values)
+  - Auto-detect numeric columns (no hardcoded sensor names)
+  - IQR k=3 (conservative outlier removal)
+  - File + stdout logging
+  - Shape/NaN guards before ML steps
+  - Prophet noise simulation from CI (conceptually correct)
+  - Modular functions (each step is its own function)
+  - Graceful error handling throughout
+=============================================================
+Usage:
+  python timeseries_pipeline.py                        # uses config.yaml
+  python timeseries_pipeline.py --config my.yaml       # custom config
+  python timeseries_pipeline.py --csv data.csv         # quick override
+=============================================================
+"""
+
+# ── Standard library ─────────────────────────────────────────
+import os
+import sys
+import argparse
+import logging
+from pathlib import Path
+from datetime import datetime
+
+# ── Third-party ───────────────────────────────────────────────
+import pandas as pd
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy.stats import zscore
+from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import StandardScaler
+
+# ── Optional: YAML config ─────────────────────────────────────
+try:
+    import yaml
+    YAML_AVAILABLE = True
+except ImportError:
+    YAML_AVAILABLE = False
+
+# ── Optional: Prophet ─────────────────────────────────────────
+try:
+    from prophet import Prophet
+    PROPHET_AVAILABLE = True
+except ImportError:
+    PROPHET_AVAILABLE = False
+
+# ═══════════════════════════════════════════════════════════════
+# DEFAULT CONFIG (used if no YAML / CLI args provided)
+# ═══════════════════════════════════════════════════════════════
+DEFAULTS = {
+    "csv_path"       : "datasets/sensor_data.csv",
+    "time_col"       : "time",
+    "sensors"        : None,        # None = auto-detect all numeric cols
+    "resample_freq"  : "min",
+    "rolling_window" : 30,
+    "iqr_k"          : 3.0,         # ← changed from 1.5; less aggressive
+    "flat_std_thresh": 0.001,
+    "flat_window"    : 10,
+    "zscore_thresh"  : 3.0,
+    "iso_contamination": 0.05,
+    "forecast_steps" : 60,
+    "prophet_ci_width": 0.95,
+    "noise_samples"  : 200,         # MC samples from Prophet CI for anomaly scoring
+    "output_dir"     : "outputs",
+    "log_file"       : "pipeline.log",
+}
+
+# ═══════════════════════════════════════════════════════════════
+# LOGGING SETUP
+# ═══════════════════════════════════════════════════════════════
+def setup_logging(output_dir: str, log_file: str) -> logging.Logger:
+    os.makedirs(output_dir, exist_ok=True)
+    log_path = os.path.join(output_dir, log_file)
+
+    logger = logging.getLogger("ts_pipeline")
+    logger.setLevel(logging.DEBUG)
+    logger.handlers.clear()
+
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s",
+                            datefmt="%Y-%m-%d %H:%M:%S")
+
+    # File handler — full detail
+    fh = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+
+    # Console handler — INFO+
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(fmt)
+    logger.addHandler(ch)
+
+    logger.info(f"Log file: {log_path}")
+    return logger
+
+
+# ═══════════════════════════════════════════════════════════════
+# CONFIG LOADING
+# ═══════════════════════════════════════════════════════════════
+def load_config(args) -> dict:
+    """
+    Priority: CLI args > YAML file > DEFAULTS.
+    """
+    cfg = DEFAULTS.copy()
+
+    # Load YAML if available and path given / default exists
+    yaml_path = getattr(args, "config", "config.yaml")
+    if YAML_AVAILABLE and yaml_path and Path(yaml_path).exists():
+        with open(yaml_path) as f:
+            yaml_cfg = yaml.safe_load(f) or {}
+        cfg.update({k: v for k, v in yaml_cfg.items() if v is not None})
+
+    # CLI overrides
+    if getattr(args, "csv", None):
+        cfg["csv_path"] = args.csv
+    if getattr(args, "output_dir", None):
+        cfg["output_dir"] = args.output_dir
+    if getattr(args, "time_col", None):
+        cfg["time_col"] = args.time_col
+
+    return cfg
+
+
+# ═══════════════════════════════════════════════════════════════
+# HELPERS
+# ═══════════════════════════════════════════════════════════════
+def save_fig(path: str, logger: logging.Logger):
+    """Save figure only if it doesn't already exist."""
+    if not os.path.exists(path):
+        plt.savefig(path, dpi=150, bbox_inches="tight")
+        logger.info(f"Saved: {path}")
+    else:
+        logger.info(f"Already exists, skipped: {path}")
+    plt.close()
+
+
+def out(cfg: dict, filename: str) -> str:
+    return os.path.join(cfg["output_dir"], filename)
+
+
+def section(title: str, logger: logging.Logger):
+    logger.info("=" * 55)
+    logger.info(f"  {title}")
+    logger.info("=" * 55)
+
+
+def assert_no_nans(df: pd.DataFrame, sensors: list, step: str, logger: logging.Logger):
+    """Guard: raise if NaNs remain before an ML step."""
+    n = df[sensors].isnull().sum().sum()
+    if n > 0:
+        msg = f"[{step}] {n} NaN values remain — aborting to prevent silent ML failures."
+        logger.error(msg)
+        raise ValueError(msg)
+    logger.debug(f"[{step}] NaN guard passed.")
+
+
+def assert_shape(df: pd.DataFrame, min_rows: int, step: str, logger: logging.Logger):
+    """Guard: raise if dataframe is too small for meaningful analysis."""
+    if len(df) < min_rows:
+        msg = f"[{step}] Only {len(df)} rows after cleaning — need at least {min_rows}."
+        logger.error(msg)
+        raise ValueError(msg)
+    logger.debug(f"[{step}] Shape guard passed: {df.shape}")
+
+
+def flag_outliers_iqr(series: pd.Series, k: float = 3.0) -> pd.Series:
+    Q1, Q3 = series.quantile(0.25), series.quantile(0.75)
+    IQR = Q3 - Q1
+    return (series < Q1 - k * IQR) | (series > Q3 + k * IQR)
+
+
+def heatmap_safe(data: pd.DataFrame, ax=None, **kwargs):
+    """
+    Plot a seaborn heatmap without x-axis label overlap.
+
+    Root cause: seaborn tries to label every column as an x-tick.
+    With 1440 timestamp columns that turns into an unreadable black bar.
+
+    Fix:
+      1. Always force xticklabels=False so seaborn draws zero labels.
+      2. After drawing, manually place at most N_TICKS evenly-spaced
+         clean HH:MM labels using matplotlib's set_xticks / set_xticklabels.
+         We use integer positions (cell indices) not column values, so there
+         is no risk of Timestamp parsing or string truncation errors.
+    """
+    N_TICKS = 8
+
+    kwargs["xticklabels"] = False      # FORCE off — setdefault is not enough
+    kwargs.setdefault("yticklabels", True)
+
+    if ax is None:
+        ax = plt.gca()
+
+    sns.heatmap(data, ax=ax, **kwargs)
+
+    # -- Build tick positions and labels purely from integer column index --
+    n_cols   = data.shape[1]
+    cols     = list(data.columns)
+    n_ticks  = min(N_TICKS, n_cols)
+    tick_idx = np.linspace(0, n_cols - 1, n_ticks, dtype=int)
+
+    tick_labels = []
+    for i in tick_idx:
+        try:
+            tick_labels.append(pd.Timestamp(cols[i]).strftime("%H:%M"))
+        except Exception:
+            # Fallback: just show truncated string
+            tick_labels.append(str(cols[i])[:5])
+
+    # Heatmap cell i occupies [i, i+1] → centre at i + 0.5
+    ax.set_xticks([i + 0.5 for i in tick_idx])
+    ax.set_xticklabels(tick_labels, rotation=0, fontsize=8, ha="center")
+    ax.tick_params(axis="x", length=0)   # remove tick marks, keep labels
+    return ax
+
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 1 — LOAD & EDA
+# ═══════════════════════════════════════════════════════════════
+def load_data(cfg: dict, logger: logging.Logger) -> tuple[pd.DataFrame, list]:
+    section("STEP 1: Load & Explore Data", logger)
+
+    path = cfg["csv_path"]
+    if not Path(path).exists():
+        raise FileNotFoundError(f"CSV not found: {path}")
+
+    df = pd.read_csv(path)
+    df[cfg["time_col"]] = pd.to_datetime(df[cfg["time_col"]])
+    df = df.sort_values(cfg["time_col"]).reset_index(drop=True)
+    df = df.set_index(cfg["time_col"])
+
+    # Auto-detect numeric sensor columns if not specified
+    sensors = cfg.get("sensors") or df.select_dtypes(include=[np.number]).columns.tolist()
+    if not sensors:
+        raise ValueError("No numeric columns found in the CSV.")
+    logger.info(f"Sensors detected: {sensors}")
+
+    logger.info(f"Shape       : {df.shape}")
+    logger.info(f"Time range  : {df.index.min()} → {df.index.max()}")
+    logger.info(f"Inferred freq: {df.index.inferred_freq}")
+    logger.debug(f"\nData types:\n{df.dtypes}")
+    logger.info(f"\nMissing values:\n{df[sensors].isnull().sum().to_string()}")
+    logger.info(f"\nMissing (%):\n{(df[sensors].isnull().sum() / len(df) * 100).round(2).to_string()}")
+    logger.info(f"\nDescriptive stats:\n{df[sensors].describe().round(4).to_string()}")
+
+    return df, sensors
+
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 2 — VISUALISE RAW DATA
+# ═══════════════════════════════════════════════════════════════
+def plot_raw(df: pd.DataFrame, sensors: list, cfg: dict, logger: logging.Logger):
+    section("STEP 2: Raw Data Plots", logger)
+
+    # Missing value heatmap
+    fig, ax = plt.subplots(figsize=(14, max(2, len(sensors))))
+    # Use integer column index so seaborn never tries to render timestamps;
+    # heatmap_safe reads the stored timestamp list separately for labels.
+    _mv = df[sensors].isnull().values.T  # bool array (sensors x time)
+    _mv_df = pd.DataFrame(_mv, index=sensors, columns=df.index)
+    heatmap_safe(_mv_df, ax=ax, cbar=False, cmap="Reds")
+    ax.set_title("Missing Value Map (Red = Missing)")
+    ax.set_xlabel("Time")
+    plt.tight_layout()
+    save_fig(out(cfg, "01_missing_value_map.png"), logger)
+
+    # Raw time series
+    fig, axes = plt.subplots(len(sensors), 1, figsize=(14, 3 * len(sensors)), sharex=True)
+    axes = np.atleast_1d(axes)
+    for i, col in enumerate(sensors):
+        axes[i].plot(df.index, df[col], color="steelblue", linewidth=0.8)
+        axes[i].set_ylabel(col)
+        axes[i].set_title(f"{col} — Raw Signal")
+    plt.suptitle("Raw Sensor Time Series", fontsize=14)
+    plt.tight_layout()
+    save_fig(out(cfg, "02_raw_time_series.png"), logger)
+
+    # Distribution histograms
+    fig, axes = plt.subplots(1, len(sensors), figsize=(5 * len(sensors), 4))
+    axes = np.atleast_1d(axes)
+    for i, col in enumerate(sensors):
+        axes[i].hist(df[col].dropna(), bins=40, color="steelblue", edgecolor="white")
+        axes[i].set_title(f"{col} Distribution")
+        axes[i].set_xlabel("Value")
+        axes[i].set_ylabel("Frequency")
+    plt.suptitle("Raw Sensor Distributions", fontsize=14)
+    plt.tight_layout()
+    save_fig(out(cfg, "03_raw_distributions.png"), logger)
+
+    # Boxplots
+    plt.figure(figsize=(max(8, len(sensors) * 2), 5))
+    df[sensors].boxplot()
+    plt.title("Boxplot — Raw Sensor Values")
+    plt.ylabel("Value")
+    plt.tight_layout()
+    save_fig(out(cfg, "04_raw_boxplots.png"), logger)
+
+    # Correlation heatmap (only meaningful with 2+ sensors)
+    if len(sensors) > 1:
+        plt.figure(figsize=(max(6, len(sensors)), max(5, len(sensors) - 1)))
+        sns.heatmap(df[sensors].corr(), annot=True, fmt=".2f",
+                    cmap="coolwarm", center=0, square=True)
+        plt.title("Sensor Correlation Heatmap")
+        plt.tight_layout()
+        save_fig(out(cfg, "05_correlation_heatmap.png"), logger)
+
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 3 — CLEAN DATA
+# ═══════════════════════════════════════════════════════════════
+def clean_data(df: pd.DataFrame, sensors: list, cfg: dict,
+               logger: logging.Logger) -> pd.DataFrame:
+    section("STEP 3: Clean & Preprocess", logger)
+
+    df_filled = df.copy()
+    df_filled = df_filled.ffill().bfill().interpolate(method="time")
+
+    # IQR outlier removal — k=3 (conservative; preserves real spikes)
+    for col in sensors:
+        mask = flag_outliers_iqr(df_filled[col], k=cfg["iqr_k"])
+        pct  = mask.mean() * 100
+        logger.info(f"  {col}: {mask.sum()} outliers removed ({pct:.1f}%) [IQR k={cfg['iqr_k']}]")
+        df_filled.loc[mask, col] = np.nan
+
+    df_filled = df_filled.interpolate(method="time")
+
+    # Resample to regular frequency
+    df_regular = df_filled.resample(cfg["resample_freq"]).mean().interpolate(method="time")
+    logger.info(f"Resampled shape: {df_regular.shape}")
+    remaining = df_regular[sensors].isnull().sum().to_dict()
+    logger.info(f"Remaining NaNs: {remaining}")
+
+    # Shape guard — need at least 2× rolling window for meaningful stats
+    min_rows = max(100, cfg["rolling_window"] * 2)
+    assert_shape(df_regular, min_rows, "clean_data", logger)
+
+    # Raw vs Cleaned overlay
+    fig, axes = plt.subplots(len(sensors), 1, figsize=(14, 3 * len(sensors)), sharex=True)
+    axes = np.atleast_1d(axes)
+    for i, col in enumerate(sensors):
+        axes[i].plot(df.index, df[col], color="tomato",
+                     linewidth=0.6, alpha=0.6, label="Raw")
+        axes[i].plot(df_regular.index, df_regular[col], color="steelblue",
+                     linewidth=0.8, label="Cleaned")
+        axes[i].set_ylabel(col)
+        axes[i].legend(loc="upper right")
+    plt.suptitle("Raw vs Cleaned Signal", fontsize=14)
+    plt.tight_layout()
+    save_fig(out(cfg, "06_raw_vs_cleaned.png"), logger)
+
+    # Rolling mean ± std
+    w = cfg["rolling_window"]
+    fig, axes = plt.subplots(len(sensors), 1, figsize=(14, 3 * len(sensors)), sharex=True)
+    axes = np.atleast_1d(axes)
+    for i, col in enumerate(sensors):
+        roll = df_regular[col].rolling(window=w)
+        axes[i].plot(df_regular.index, df_regular[col],
+                     color="lightsteelblue", linewidth=0.6, label="Signal")
+        axes[i].plot(df_regular.index, roll.mean(), color="steelblue",
+                     linewidth=1.5, label="Rolling Mean")
+        axes[i].fill_between(df_regular.index,
+                             roll.mean() - roll.std(),
+                             roll.mean() + roll.std(),
+                             alpha=0.3, color="steelblue", label="±1 Std")
+        axes[i].set_ylabel(col)
+        axes[i].legend(loc="upper right")
+    plt.suptitle(f"Rolling Mean ± Std Dev (window={w})", fontsize=14)
+    plt.tight_layout()
+    save_fig(out(cfg, "07_rolling_mean_std.png"), logger)
+
+    return df_regular
+
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 4 — ANOMALY DETECTION
+# ═══════════════════════════════════════════════════════════════
+def detect_anomalies(df_regular: pd.DataFrame, sensors: list,
+                     cfg: dict, logger: logging.Logger) -> tuple:
+    section("STEP 4: Anomaly Detection", logger)
+
+    # NaN guard before all ML steps
+    assert_no_nans(df_regular, sensors, "detect_anomalies", logger)
+
+    w = cfg["rolling_window"]
+    zt = cfg["zscore_thresh"]
+
+    # ── Method A: Z-score ──────────────────────────────────────
+    logger.info(f"[A] Z-score (|Z| > {zt})")
+    z_scores    = df_regular[sensors].apply(zscore)
+    z_anomalies = z_scores.abs() > zt
+    for col in sensors:
+        logger.info(f"    {col}: {z_anomalies[col].sum()} anomalies")
+
+    fig, axes = plt.subplots(len(sensors), 1, figsize=(14, 3 * len(sensors)), sharex=True)
+    axes = np.atleast_1d(axes)
+    for i, col in enumerate(sensors):
+        axes[i].plot(df_regular.index, df_regular[col], color="steelblue",
+                     linewidth=0.8, label="Signal")
+        axes[i].scatter(df_regular.index[z_anomalies[col]],
+                        df_regular[col][z_anomalies[col]],
+                        color="red", s=30, zorder=5, label="Anomaly")
+        axes[i].set_ylabel(col)
+        axes[i].legend(loc="upper right")
+    plt.suptitle(f"Z-score Anomaly Detection (|Z| > {zt})", fontsize=14)
+    plt.tight_layout()
+    save_fig(out(cfg, "08_zscore_anomalies.png"), logger)
+
+    # ── Method B: Rolling ±3σ ──────────────────────────────────
+    logger.info(f"[B] Rolling Mean ±{zt}σ (window={w})")
+    rolling_anomalies = pd.DataFrame(index=df_regular.index)
+    fig, axes = plt.subplots(len(sensors), 1, figsize=(14, 3 * len(sensors)), sharex=True)
+    axes = np.atleast_1d(axes)
+    for i, col in enumerate(sensors):
+        rm    = df_regular[col].rolling(w).mean()
+        rstd  = df_regular[col].rolling(w).std()
+        upper = rm + zt * rstd
+        lower = rm - zt * rstd
+        mask  = (df_regular[col] > upper) | (df_regular[col] < lower)
+        rolling_anomalies[col] = mask
+        logger.info(f"    {col}: {mask.sum()} anomalies")
+
+        axes[i].plot(df_regular.index, df_regular[col], color="steelblue",
+                     linewidth=0.8, label="Signal")
+        axes[i].plot(df_regular.index, rm, color="orange",
+                     linewidth=1.2, label="Rolling Mean")
+        axes[i].fill_between(df_regular.index, lower, upper,
+                             alpha=0.2, color="orange", label=f"±{zt}σ Band")
+        axes[i].scatter(df_regular.index[mask], df_regular[col][mask],
+                        color="red", s=30, zorder=5, label="Anomaly")
+        axes[i].set_ylabel(col)
+        axes[i].legend(loc="upper right")
+    plt.suptitle(f"Rolling Mean ±{zt}σ Anomaly Detection (window={w})", fontsize=14)
+    plt.tight_layout()
+    save_fig(out(cfg, "09_rolling_anomalies.png"), logger)
+
+    # ── Method C: Flat Line ────────────────────────────────────
+    logger.info("[C] Flat Line / Sensor Failure")
+    flat_thresh = cfg["flat_std_thresh"]
+    flat_win    = cfg["flat_window"]
+    fig, axes = plt.subplots(len(sensors), 1, figsize=(14, 3 * len(sensors)), sharex=True)
+    axes = np.atleast_1d(axes)
+    for i, col in enumerate(sensors):
+        rstd      = df_regular[col].rolling(flat_win).std()
+        flat_mask = rstd < flat_thresh
+        logger.info(f"    {col}: {flat_mask.sum()} flat-line points")
+
+        axes[i].plot(df_regular.index, df_regular[col],
+                     color="steelblue", linewidth=0.8, label="Signal")
+        ymin, ymax = df_regular[col].min(), df_regular[col].max()
+        axes[i].fill_between(df_regular.index, ymin, ymax,
+                             where=flat_mask, color="red", alpha=0.3,
+                             label="Flat Line Zone")
+        axes[i].set_ylabel(col)
+        axes[i].legend(loc="upper right")
+    plt.suptitle("Flat Line / Sensor Failure Detection", fontsize=14)
+    plt.tight_layout()
+    save_fig(out(cfg, "10_flatline_detection.png"), logger)
+
+    # ── Method D: Isolation Forest ─────────────────────────────
+    logger.info("[D] Isolation Forest (ML)")
+    scaler   = StandardScaler()
+    clean_df = df_regular[sensors].dropna()
+
+    assert_shape(clean_df, 50, "IsolationForest", logger)
+
+    X_hist   = scaler.fit_transform(clean_df)
+    iso      = IsolationForest(contamination=cfg["iso_contamination"], random_state=42)
+    iso.fit(X_hist)
+    preds    = iso.predict(X_hist)
+    scores   = iso.decision_function(X_hist)
+    iso_index = clean_df.index
+    iso_mask  = preds == -1
+    logger.info(f"    Total: {iso_mask.sum()} anomalies ({iso_mask.mean()*100:.2f}%)")
+
+    fig, axes = plt.subplots(len(sensors), 1, figsize=(14, 3 * len(sensors)), sharex=True)
+    axes = np.atleast_1d(axes)
+    for i, col in enumerate(sensors):
+        axes[i].plot(iso_index, df_regular.loc[iso_index, col],
+                     color="steelblue", linewidth=0.8, label="Signal")
+        axes[i].scatter(iso_index[iso_mask],
+                        df_regular.loc[iso_index, col][iso_mask],
+                        color="red", s=30, zorder=5, label="Anomaly")
+        axes[i].set_ylabel(col)
+        axes[i].legend(loc="upper right")
+    plt.suptitle("Isolation Forest Anomaly Detection", fontsize=14)
+    plt.tight_layout()
+    save_fig(out(cfg, "11_isolation_forest_anomalies.png"), logger)
+
+    # Isolation Forest score over time
+    plt.figure(figsize=(14, 3))
+    plt.plot(iso_index, scores, color="purple", linewidth=0.8)
+    plt.axhline(0, color="red", linestyle="--", label="Decision Boundary")
+    plt.title("Isolation Forest — Anomaly Score Over Time")
+    plt.ylabel("Score (lower = more anomalous)")
+    plt.legend()
+    plt.tight_layout()
+    save_fig(out(cfg, "12_isolation_forest_score.png"), logger)
+
+    # Z-score heatmap
+    fig, ax = plt.subplots(figsize=(14, max(3, len(sensors))))
+    _zv = z_scores[sensors].values.T  # float array (sensors x time)
+    _zv_df = pd.DataFrame(_zv, index=sensors, columns=df_regular.index)
+    heatmap_safe(_zv_df, ax=ax, cmap="coolwarm", center=0, cbar=True)
+    ax.set_title("Z-score Heatmap")
+    ax.set_xlabel("Time")
+    plt.tight_layout()
+    save_fig(out(cfg, "13_zscore_heatmap.png"), logger)
+
+    # Combined Anomaly Summary Heatmap
+    summary = pd.DataFrame(index=iso_index)
+    for col in sensors:
+        summary[f"{col}_zscore"]  = z_anomalies.loc[iso_index, col].astype(int).values
+        summary[f"{col}_rolling"] = rolling_anomalies.loc[iso_index, col].astype(int).values
+    summary["isolation_forest"] = iso_mask.astype(int)
+
+    fig, ax = plt.subplots(figsize=(14, max(4, len(summary.columns))))
+    _sv = summary.values.T  # (methods x time)
+    _sv_df = pd.DataFrame(_sv, index=summary.columns, columns=iso_index)
+    heatmap_safe(_sv_df, ax=ax, cmap="Reds", cbar=False)
+    ax.set_title("Combined Anomaly Map — All Methods")
+    ax.set_xlabel("Time")
+    plt.tight_layout()
+    save_fig(out(cfg, "14_combined_anomaly_map.png"), logger)
+
+    return scaler, iso, iso_index, iso_mask, z_anomalies, rolling_anomalies
+
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 5 — ANOMALY PREDICTION (Prophet + Monte Carlo CI noise)
+# ═══════════════════════════════════════════════════════════════
+def predict_anomalies(df_regular: pd.DataFrame, sensors: list,
+                      scaler: StandardScaler, iso: IsolationForest,
+                      cfg: dict, logger: logging.Logger):
+    section("STEP 5: Anomaly Prediction (Prophet + MC Noise Simulation)", logger)
+
+    results       = {}
+    n_samples     = cfg["noise_samples"]   # MC draws from CI
+    freq          = cfg["resample_freq"]
+    steps         = cfg["forecast_steps"]
+
+    fig, axes = plt.subplots(len(sensors), 1, figsize=(14, 4 * len(sensors)))
+    axes = np.atleast_1d(axes)
+
+    for i, col in enumerate(sensors):
+        logger.info(f"Training Prophet for {col}...")
+        prophet_df = df_regular[[col]].reset_index()
+        prophet_df.columns = ["ds", "y"]
+        prophet_df["ds"] = pd.to_datetime(prophet_df["ds"]).dt.tz_localize(None)
+
+        try:
+            model = Prophet(
+                changepoint_prior_scale=0.05,
+                seasonality_mode="additive",
+                interval_width=cfg["prophet_ci_width"],
+            )
+            model.fit(prophet_df)
+        except Exception as e:
+            logger.error(f"Prophet failed for {col}: {e}")
+            continue
+
+        future   = model.make_future_dataframe(periods=steps, freq=freq)
+        forecast = model.predict(future)
+        results[col] = {"prophet_df": prophet_df, "forecast": forecast}
+
+        hist_fc = forecast[forecast["ds"] <= prophet_df["ds"].max()]
+        fut_fc  = forecast[forecast["ds"] >  prophet_df["ds"].max()]
+
+        axes[i].plot(prophet_df["ds"], prophet_df["y"],
+                     color="steelblue", linewidth=0.8, label="Historical")
+        axes[i].plot(hist_fc["ds"], hist_fc["yhat"],
+                     color="orange", linewidth=1, label="Fitted")
+        axes[i].fill_between(hist_fc["ds"],
+                             hist_fc["yhat_lower"], hist_fc["yhat_upper"],
+                             alpha=0.2, color="orange")
+        axes[i].plot(fut_fc["ds"], fut_fc["yhat"],
+                     color="green", linewidth=1.5, linestyle="--",
+                     label=f"Forecast (+{steps})")
+        axes[i].fill_between(fut_fc["ds"],
+                             fut_fc["yhat_lower"], fut_fc["yhat_upper"],
+                             alpha=0.3, color="green",
+                             label=f"{int(cfg['prophet_ci_width']*100)}% CI")
+        axes[i].set_ylabel(col)
+        axes[i].legend(loc="upper right", fontsize=8)
+
+    plt.suptitle(f"Prophet Forecast: Next {steps} Steps", fontsize=14)
+    plt.tight_layout()
+    save_fig(out(cfg, "15_prophet_forecast.png"), logger)
+
+    if not results:
+        logger.warning("Prophet training failed for all sensors. Skipping prediction.")
+        return
+
+    # ── Build base future DataFrame ────────────────────────────
+    future_preds = pd.DataFrame()
+    for col, res in results.items():
+        fc   = res["forecast"]
+        pdf  = res["prophet_df"]
+        fut  = fc[fc["ds"] > pdf["ds"].max()][["ds", "yhat", "yhat_lower", "yhat_upper"]].copy()
+        fut  = fut.rename(columns={"yhat": col,
+                                   "yhat_lower": f"{col}_lower",
+                                   "yhat_upper": f"{col}_upper"})
+        future_preds = fut if future_preds.empty else future_preds.merge(fut, on="ds")
+
+    future_preds = future_preds.set_index("ds")
+
+    # ── Monte Carlo anomaly scoring from Prophet CI ────────────
+    # Instead of scoring only yhat (smooth → biased low variance),
+    # we draw n_samples from Uniform(yhat_lower, yhat_upper) per
+    # timestep and sensor, then score each sample with Isolation
+    # Forest. Anomaly probability = fraction of samples flagged.
+    logger.info(f"Monte Carlo CI sampling: {n_samples} draws per timestep ...")
+    rng      = np.random.default_rng(42)
+    n_steps  = len(future_preds)
+
+    # Collect all MC draws → shape (n_steps, n_sensors, n_samples)
+    mc_data  = {}
+    for col in results:
+        lo = future_preds[f"{col}_lower"].values
+        hi = future_preds[f"{col}_upper"].values
+        # Clip so lo <= hi (Prophet can occasionally swap them)
+        lo, hi = np.minimum(lo, hi), np.maximum(lo, hi)
+        mc_data[col] = rng.uniform(lo[:, None], hi[:, None],
+                                   size=(n_steps, n_samples))  # (T, S)
+
+    # Score each MC sample through Isolation Forest
+    # X shape: (T * n_samples, n_sensors)
+    mc_matrix = np.stack(
+        [mc_data[col] for col in results], axis=-1
+    )  # (T, n_samples, n_sensors)
+    mc_flat   = mc_matrix.reshape(-1, len(results))           # (T*S, n_sensors)
+
+    try:
+        X_scaled   = scaler.transform(mc_flat)
+        iso_preds  = iso.predict(X_scaled)                    # -1 or 1
+        iso_scores = iso.decision_function(X_scaled)
+    except Exception as e:
+        logger.error(f"Isolation Forest scoring failed: {e}")
+        return
+
+    # Reshape back → (T, n_samples)
+    iso_preds_r  = iso_preds.reshape(n_steps, n_samples)
+    iso_scores_r = iso_scores.reshape(n_steps, n_samples)
+
+    # Anomaly probability and mean score per timestep
+    future_preds["anomaly_prob"]  = (iso_preds_r == -1).mean(axis=1)
+    future_preds["anomaly_score"] = iso_scores_r.mean(axis=1)
+    future_preds["is_anomaly"]    = future_preds["anomaly_prob"] > 0.5  # majority vote
+
+    # Point estimates (yhat) for plotting
+    for col in results:
+        future_preds[col] = results[col]["forecast"].set_index("ds").loc[
+            future_preds.index, "yhat"
+        ]
+
+    # ── Report predicted anomalies ─────────────────────────────
+    anomaly_times = future_preds[future_preds["is_anomaly"]]
+    logger.info(f"Predicted {len(anomaly_times)} anomalies in next {steps} steps "
+                f"(MC majority-vote, {n_samples} samples):")
+    if not anomaly_times.empty:
+        for idx, row in anomaly_times.iterrows():
+            vals = {col: f"{row[col]:.4f}" for col in results}
+            logger.info(f"  ⏰ {idx} | sensors={vals} | "
+                        f"prob={row['anomaly_prob']:.2f} | "
+                        f"score={row['anomaly_score']:.4f}")
+
+        next_anom  = anomaly_times.index[0]
+        time_until = next_anom - future_preds.index[0]
+        logger.info(f"Next anomaly at   : {next_anom}")
+        logger.info(f"Time until anomaly: {time_until}")
+    else:
+        logger.info(f"No anomalies predicted in the next {steps} steps.")
+
+    # ── Plot predicted anomalies ───────────────────────────────
+    fig, axes = plt.subplots(len(results), 1,
+                             figsize=(14, 4 * len(results)), sharex=True)
+    axes = np.atleast_1d(axes)
+    for i, col in enumerate(results):
+        fc  = results[col]["forecast"]
+        pdf = results[col]["prophet_df"]
+        fut = fc[fc["ds"] > pdf["ds"].max()]
+
+        axes[i].plot(pdf["ds"], pdf["y"],
+                     color="steelblue", linewidth=0.8, alpha=0.6,
+                     label="Historical")
+        axes[i].plot(fut["ds"], fut["yhat"],
+                     color="green", linewidth=1.5, linestyle="--",
+                     label="Forecast (yhat)")
+        axes[i].fill_between(fut["ds"],
+                             fut["yhat_lower"], fut["yhat_upper"],
+                             alpha=0.2, color="green")
+        if not anomaly_times.empty:
+            axes[i].scatter(anomaly_times.index, anomaly_times[col],
+                            color="red", s=80, zorder=6,
+                            marker="X", label="Predicted Anomaly")
+        axes[i].axvline(pdf["ds"].max(), color="gray",
+                        linestyle=":", linewidth=1.5, label="Now")
+        axes[i].set_ylabel(col)
+        axes[i].legend(loc="upper right", fontsize=8)
+
+    plt.suptitle("Predicted Anomalies on Forecasted Values (MC CI Sampling)", fontsize=14)
+    plt.tight_layout()
+    save_fig(out(cfg, "16_predicted_anomalies.png"), logger)
+
+    # Anomaly probability & score over forecast window
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 6), sharex=True)
+
+    ax1.plot(future_preds.index, future_preds["anomaly_prob"],
+             color="darkorange", linewidth=1.2)
+    ax1.axhline(0.5, color="red", linestyle="--", label="50% threshold")
+    ax1.fill_between(future_preds.index, future_preds["anomaly_prob"],
+                     where=future_preds["is_anomaly"],
+                     color="red", alpha=0.3, label="Anomaly Zone")
+    ax1.set_ylabel("Anomaly Probability")
+    ax1.set_title("MC Anomaly Probability Over Forecast Window")
+    ax1.legend()
+
+    ax2.plot(future_preds.index, future_preds["anomaly_score"],
+             color="purple", linewidth=1.2)
+    ax2.axhline(0, color="red", linestyle="--", label="Decision Boundary")
+    ax2.fill_between(future_preds.index, future_preds["anomaly_score"],
+                     where=future_preds["is_anomaly"],
+                     color="red", alpha=0.3)
+    ax2.set_ylabel("Mean Anomaly Score")
+    ax2.set_xlabel("Time")
+    ax2.legend()
+
+    plt.tight_layout()
+    save_fig(out(cfg, "17_forecast_anomaly_score.png"), logger)
+
+
+# ═══════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════
+def main():
+    parser = argparse.ArgumentParser(
+        description="Time Series Anomaly Detection & Prediction Pipeline"
+    )
+    parser.add_argument("--config",     default="config.yaml",
+                        help="Path to YAML config file (default: config.yaml)")
+    parser.add_argument("--csv",        default=None,
+                        help="Override CSV path from config")
+    parser.add_argument("--time-col",   default=None,
+                        help="Override timestamp column name")
+    parser.add_argument("--output-dir", default=None,
+                        help="Override output directory")
+    args = parser.parse_args()
+
+    cfg    = load_config(args)
+    logger = setup_logging(cfg["output_dir"], cfg["log_file"])
+
+    logger.info("=" * 55)
+    logger.info("  TIME SERIES PIPELINE — START")
+    logger.info(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info("=" * 55)
+    logger.debug(f"Config: {cfg}")
+
+    try:
+        # Step 1 — Load
+        df, sensors = load_data(cfg, logger)
+
+        # Inject resolved sensor list back into cfg for downstream use
+        cfg["sensors"] = sensors
+
+        # Step 2 — Raw plots
+        plot_raw(df, sensors, cfg, logger)
+
+        # Step 3 — Clean
+        df_regular = clean_data(df, sensors, cfg, logger)
+
+        # Step 4 — Detect
+        scaler, iso, iso_index, iso_mask, z_anom, roll_anom = detect_anomalies(
+            df_regular, sensors, cfg, logger
+        )
+
+        # Step 5 — Predict (optional)
+        if PROPHET_AVAILABLE:
+            predict_anomalies(df_regular, sensors, scaler, iso, cfg, logger)
+        else:
+            logger.warning("Prophet not installed — skipping prediction step.")
+            logger.warning("Install with: pip install prophet")
+
+        logger.info("=" * 55)
+        logger.info(f"  PIPELINE COMPLETE — outputs in ./{cfg['output_dir']}/")
+        logger.info("=" * 55)
+
+    except FileNotFoundError as e:
+        logger.error(str(e))
+        sys.exit(1)
+    except ValueError as e:
+        logger.error(str(e))
+        sys.exit(1)
+    except Exception as e:
+        logger.exception(f"Unexpected error: {e}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

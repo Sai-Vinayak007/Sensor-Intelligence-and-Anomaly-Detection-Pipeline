@@ -1,0 +1,100 @@
+2026-05-18 15:39:05 [INFO] Log file: outputs\pipeline.log
+2026-05-18 15:39:05 [INFO] =======================================================
+2026-05-18 15:39:05 [INFO]   TIME SERIES PIPELINE — START
+2026-05-18 15:39:05 [INFO]   2026-05-18 15:39:05
+2026-05-18 15:39:05 [INFO] =======================================================
+2026-05-18 15:39:05 [DEBUG] Config: {'csv_path': 'datasets/sensor_data.csv', 'time_col': 'time', 'sensors': None, 'resample_freq': 'min', 'rolling_window': 30, 'iqr_k': 3.0, 'flat_std_thresh': 0.001, 'flat_window': 10, 'zscore_thresh': 3.0, 'iso_contamination': 0.05, 'forecast_steps': 60, 'prophet_ci_width': 0.95, 'noise_samples': 200, 'output_dir': 'outputs', 'log_file': 'pipeline.log'}
+2026-05-18 15:39:05 [INFO] =======================================================
+2026-05-18 15:39:05 [INFO]   STEP 1: Load & Explore Data
+2026-05-18 15:39:05 [INFO] =======================================================
+2026-05-18 15:39:05 [INFO] Sensors detected: ['SensorA', 'SensorB', 'SensorC']
+2026-05-18 15:39:05 [INFO] Shape       : (1440, 3)
+2026-05-18 15:39:05 [INFO] Time range  : 2026-05-18 00:00:00 → 2026-05-18 23:59:00
+2026-05-18 15:39:05 [INFO] Inferred freq: min
+2026-05-18 15:39:05 [DEBUG] 
+Data types:
+SensorA    float64
+SensorB    float64
+SensorC    float64
+dtype: object
+2026-05-18 15:39:05 [INFO] 
+Missing values:
+SensorA    137
+SensorB    235
+SensorC     48
+2026-05-18 15:39:05 [INFO] 
+Missing (%):
+SensorA     9.51
+SensorB    16.32
+SensorC     3.33
+2026-05-18 15:39:05 [INFO] 
+Descriptive stats:
+         SensorA    SensorB    SensorC
+count  1303.0000  1205.0000  1392.0000
+mean      9.7936     3.2159     8.0136
+std       2.0382     2.8437     2.1386
+min       1.4163    -2.7400     1.0560
+25%       8.4662     1.1146     6.5240
+50%       9.8097     3.2109     8.1706
+75%      11.2387     5.4647     9.6188
+max      18.1075     9.5640    14.3080
+2026-05-18 15:39:05 [INFO] =======================================================
+2026-05-18 15:39:05 [INFO]   STEP 2: Raw Data Plots
+2026-05-18 15:39:05 [INFO] =======================================================
+2026-05-18 15:39:06 [INFO] Saved: outputs\01_missing_value_map.png
+2026-05-18 15:39:07 [INFO] Saved: outputs\02_raw_time_series.png
+2026-05-18 15:39:07 [INFO] Saved: outputs\03_raw_distributions.png
+2026-05-18 15:39:07 [INFO] Saved: outputs\04_raw_boxplots.png
+2026-05-18 15:39:08 [INFO] Saved: outputs\05_correlation_heatmap.png
+2026-05-18 15:39:08 [INFO] =======================================================
+2026-05-18 15:39:08 [INFO]   STEP 3: Clean & Preprocess
+2026-05-18 15:39:08 [INFO] =======================================================
+2026-05-18 15:39:08 [INFO]   SensorA: 0 outliers removed (0.0%) [IQR k=3.0]
+2026-05-18 15:39:08 [INFO]   SensorB: 0 outliers removed (0.0%) [IQR k=3.0]
+2026-05-18 15:39:08 [INFO]   SensorC: 0 outliers removed (0.0%) [IQR k=3.0]
+2026-05-18 15:39:08 [INFO] Resampled shape: (1440, 3)
+2026-05-18 15:39:08 [INFO] Remaining NaNs: {'SensorA': 0, 'SensorB': 0, 'SensorC': 0}
+2026-05-18 15:39:08 [DEBUG] [clean_data] Shape guard passed: (1440, 3)
+2026-05-18 15:39:08 [INFO] Saved: outputs\06_raw_vs_cleaned.png
+2026-05-18 15:39:09 [INFO] Saved: outputs\07_rolling_mean_std.png
+2026-05-18 15:39:09 [INFO] =======================================================
+2026-05-18 15:39:09 [INFO]   STEP 4: Anomaly Detection
+2026-05-18 15:39:09 [INFO] =======================================================
+2026-05-18 15:39:09 [DEBUG] [detect_anomalies] NaN guard passed.
+2026-05-18 15:39:09 [INFO] [A] Z-score (|Z| > 3.0)
+2026-05-18 15:39:09 [INFO]     SensorA: 5 anomalies
+2026-05-18 15:39:09 [INFO]     SensorB: 0 anomalies
+2026-05-18 15:39:09 [INFO]     SensorC: 1 anomalies
+2026-05-18 15:39:10 [INFO] Saved: outputs\08_zscore_anomalies.png
+2026-05-18 15:39:10 [INFO] [B] Rolling Mean ±3.0σ (window=30)
+2026-05-18 15:39:10 [INFO]     SensorA: 4 anomalies
+2026-05-18 15:39:10 [INFO]     SensorB: 1 anomalies
+2026-05-18 15:39:10 [INFO]     SensorC: 3 anomalies
+2026-05-18 15:39:10 [INFO] Saved: outputs\09_rolling_anomalies.png
+2026-05-18 15:39:10 [INFO] [C] Flat Line / Sensor Failure
+2026-05-18 15:39:10 [INFO]     SensorA: 0 flat-line points
+2026-05-18 15:39:11 [INFO]     SensorB: 0 flat-line points
+2026-05-18 15:39:11 [INFO]     SensorC: 0 flat-line points
+2026-05-18 15:39:11 [INFO] Saved: outputs\10_flatline_detection.png
+2026-05-18 15:39:11 [INFO] [D] Isolation Forest (ML)
+2026-05-18 15:39:11 [DEBUG] [IsolationForest] Shape guard passed: (1440, 3)
+2026-05-18 15:39:11 [INFO]     Total: 72 anomalies (5.00%)
+2026-05-18 15:39:12 [INFO] Saved: outputs\11_isolation_forest_anomalies.png
+2026-05-18 15:39:12 [INFO] Saved: outputs\12_isolation_forest_score.png
+2026-05-18 15:39:13 [INFO] Saved: outputs\13_zscore_heatmap.png
+2026-05-18 15:39:13 [INFO] Saved: outputs\14_combined_anomaly_map.png
+2026-05-18 15:39:13 [INFO] =======================================================
+2026-05-18 15:39:13 [INFO]   STEP 5: Anomaly Prediction (Prophet + MC Noise Simulation)
+2026-05-18 15:39:13 [INFO] =======================================================
+2026-05-18 15:39:13 [INFO] Training Prophet for SensorA...
+2026-05-18 15:39:14 [INFO] Training Prophet for SensorB...
+2026-05-18 15:39:15 [INFO] Training Prophet for SensorC...
+2026-05-18 15:39:16 [INFO] Saved: outputs\15_prophet_forecast.png
+2026-05-18 15:39:16 [INFO] Monte Carlo CI sampling: 200 draws per timestep ...
+2026-05-18 15:39:17 [INFO] Predicted 0 anomalies in next 60 steps (MC majority-vote, 200 samples):
+2026-05-18 15:39:17 [INFO] No anomalies predicted in the next 60 steps.
+2026-05-18 15:39:17 [INFO] Saved: outputs\16_predicted_anomalies.png
+2026-05-18 15:39:18 [INFO] Saved: outputs\17_forecast_anomaly_score.png
+2026-05-18 15:39:18 [INFO] =======================================================
+2026-05-18 15:39:18 [INFO]   PIPELINE COMPLETE — outputs in ./outputs/
+2026-05-18 15:39:18 [INFO] =======================================================

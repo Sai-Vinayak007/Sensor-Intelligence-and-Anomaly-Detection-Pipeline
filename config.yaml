@@ -1,0 +1,28 @@
+# Input
+csv_path  : "datasets/sensor_data.csv"
+time_col  : "time"
+
+# Sensors to analyse.
+# Leave as null to auto-detect ALL numeric columns.
+sensors   : null
+# sensors : ["SensorA", "SensorB", "SensorC"]   # explicit list example
+
+# Preprocessing
+resample_freq  : "min"    # "min"=1-minute, "H"=hourly, "D"=daily
+rolling_window : 30       # window for rolling stats
+iqr_k          : 3.0      # IQR multiplier for outlier removal (3 = conservative)
+flat_std_thresh: 0.001    # rolling std below this = flat-line sensor failure
+flat_window    : 10       # window for flat-line detection
+
+# Anomaly detection thresholds
+zscore_thresh      : 3.0   # |Z| threshold for z-score method
+iso_contamination  : 0.05  # expected anomaly fraction for Isolation Forest
+
+# Forecasting (Prophet)
+forecast_steps  : 60    # how many steps ahead to predict
+prophet_ci_width: 0.95  # confidence interval width (95%)
+noise_samples   : 200   # Monte Carlo draws per timestep for CI-aware scoring
+
+# Output
+output_dir : "outputs"
+log_file   : "pipeline.log"
